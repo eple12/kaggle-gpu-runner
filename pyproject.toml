@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kaggle-gpu-runner"
+version = "0.1.0"
+description = "Push a training job to a Kaggle GPU kernel, wait for it, fetch the checkpoints -- from any project."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = [
+    "kaggle>=1.6",
+    "tomli>=1.1; python_version < '3.11'",
+]
+
+[project.scripts]
+kgr = "kgr.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

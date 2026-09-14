@@ -1,0 +1,20 @@
+# A complete, working config for examples/minimal/train.py.
+# Copy it to your project root and adapt.
+
+[kaggle]
+user = "your-kaggle-username"
+project = "kgr-example"
+accelerator = "NvidiaTeslaT4"
+
+[bundle]
+include = ["train.py"]
+
+[run]
+command = "python -u train.py --run-name {run} --out {output_dir} --device {device} {extra}"
+default_extra = "--steps 2000"
+output_dir = "outputs"
+resume_glob = "{run}*"
+
+[fetch]
+dest = "outputs"
+glob = "{run}*"
