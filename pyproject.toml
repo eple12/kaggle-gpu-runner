@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kaggle-gpu-runner"
-version = "0.1.0"
-description = "Push a training job to a Kaggle GPU kernel, wait for it, fetch the checkpoints -- from any project."
+version = "0.2.0"
+description = "Run a job on a Kaggle GPU kernel, wait for it, fetch or cancel it -- from any project."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }

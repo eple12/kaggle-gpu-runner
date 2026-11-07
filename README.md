@@ -10,12 +10,30 @@ kgr push resnet_v3          # bundle -> private dataset -> script kernel (starts
 kgr wait resnet_v3          # poll until COMPLETE / ERROR
 kgr fetch resnet_v3         # checkpoints -> ./outputs
 kgr run  resnet_v3          # all three
+kgr cancel resnet_v3        # hard stop; files already on disk are kept
+kgr exec train.py -- --lr 3e-4   # one script, no kgr.toml at all
 ```
 
 Why Kaggle for long runs: a kernel runs **non-interactively for up to 9 h on a
 GPU** (T4 ×2 / P100 / L4, ~30 GPU-hours a week), so there is no browser
 session to keep alive. For interactive or session-based work see the sibling
 project [colab-gpu-runner](https://github.com/eple12/colab-gpu-runner).
+
+## Quick start (new machine, new project)
+
+```bash
+pipx install git+https://github.com/eple12/kaggle-gpu-runner   # or pip install -U ...
+kgr doctor                       # kaggle CLI, token, quota, cancel support
+cd my-competition
+kgr exec --gpu t4 --competition titanic train.py -- --epochs 20
+```
+
+`kgr` takes your username from the `kaggle` CLI login (`kaggle config view`),
+so a bare script needs no config. `kgr exec` uploads just that script (plus
+`--include` globs), runs it on Kaggle, waits, and leaves everything the script
+wrote to `$KGR_OUTPUT_DIR` in `./outputs/<name>/`. For a project you run
+repeatedly, `kgr init` writes a `kgr.toml` (`kgr init --global --user NAME`
+stores the username once for every project).
 
 ## How it works
 
@@ -26,6 +44,7 @@ kgr.toml ─┐
 code  ────┼─ kgr push ─► dataset  <user>/<project>-code   (new version each push)
           │            ► kernel   <user>/<project>-<run>  (script, GPU, private)
           │                 │  kernel_runner.py:
+          │                 │   0. print KGR_SESSION_INFO (ids for kgr cancel)
           │                 │   1. GPU check (abort on CPU / unsupported card)
           │                 │   2. find THIS push's bundle (build id)
           │                 │   3. unpack to /tmp, link output_dir -> /kaggle/working
@@ -153,10 +172,85 @@ Useful flags: `--dry-run` (stage bundle + metadata locally, send nothing —
 inspect what would be uploaded), `--skip-hooks`, `--accelerator NvidiaL4`,
 `kgr fetch --all` (whole output tree to `<dest>/<run>/`), `kgr ref <run>`.
 
+### Managing a run
+
+| command | what it does |
+| --- | --- |
+| `kgr runs` | every run pushed from this project, with live status and session id |
+| `kgr info RUN` | kernel URL, status, GPU, and the session / container ids the kernel reported (`--json`, `--refresh`) |
+| `kgr cancel RUN` | stop the kernel (see below); `--fetch` downloads whatever it saved |
+| `kgr logs RUN` | print the log; `--tail 50`, `--save [FILE]`, `-f` to follow |
+| `kgr quota` | weekly GPU / TPU hours left |
+| `kgr push RUN --resume` | continue from this run's own previous output (`--resume-from` for another kernel) |
+| `kgr push RUN --gpu t4` | accelerator shortcuts `t4`, `p100`, `l4`, `none` for `--accelerator` |
+
+### Cancelling
+
+The `kaggle` CLI cannot cancel a kernel, and nothing it prints names the
+*session* of the run in progress. The API underneath can
+(`CancelKernelSession(kernel_session_id)`), so `kgr` closes the gap from the
+inside: the first thing every kernel does is print one line
+
+```
+KGR_SESSION_INFO {"run": ..., "hostname": ..., "containers": [...], "id_candidates": {...}, "env": {...}}
+```
+
+(also saved as `kgr_session.json` in the output). It holds the `KAGGLE_*`
+environment (tokens and keys redacted), the hostname, container ids and every
+numeric id-like variable. `kgr wait` / `watch` / `info` read that line back,
+store it in `.kgr/runs/<run>.json`, and `kgr cancel` sends the session id to
+the API, then waits until the status is `CANCEL_*`.
+
+```bash
+kgr cancel exp_01                      # id found automatically
+kgr cancel exp_01 --session-id 123456  # or a URL ending in the id
+kgr cancel exp_01 --fetch              # stop, then download what it saved
+```
+
+- Which variable is the session id is decided by name
+  (`KAGGLE_KERNEL_SESSION_ID`, `KAGGLE_SESSION_ID`, ...). If none matches,
+  `kgr` never guesses between several candidates: it lists them, and you pass
+  `--session-id`, or set `[cancel] session_env = "NAME"` once. **`kgr probe`
+  runs a throwaway CPU kernel and prints exactly what Kaggle reports** -- run
+  it once to see which variable is yours.
+- What a real Batch kernel exposes (`kgr probe`): no variable named like an id,
+  but `KAGGLE_CONTAINER_NAME=kaggle_<token>-<number>-webtier`. `kgr` takes that
+  number as the session id when nothing better is reported -- **verified**: the
+  API cancelled the kernel with exactly that number.
+- `kgr exec` leaves no `kgr.toml`, only `.kgr/runs/`; `status`, `info`, `cancel`,
+  `wait`, `fetch`, `logs` work from that same directory.
+- A kernel still `QUEUED` has not started, so it has printed nothing; use the
+  Stop button on its page (`kgr cancel` prints the link).
+- **Cancel is a hard stop.** Verified on a live kernel: the session ended
+  `CANCEL_REQUESTED` -> `CANCEL_ACKNOWLEDGED` within seconds, the job got no
+  SIGTERM and no summary was written, but files it had already written to the
+  output directory were kept and `kgr fetch` downloads them. So checkpoint
+  periodically and atomically (the contract above); do not rely on a
+  last-moment save. (The runner still forwards SIGTERM/SIGINT if it ever
+  receives one, best effort.)
+- Needs `kaggle>=2.x` (its SDK has the cancel call); `kgr doctor` checks.
+
+### Competitions
+
+```bash
+kgr data titanic                       # download + unzip into ./data/titanic
+kgr exec --competition titanic train.py
+kgr submit titanic submission.csv -m "lr 3e-4"
+kgr submit titanic --run exp_01 -m "from kernel"   # code competitions: a kernel's output
+kgr submissions titanic
+```
+
+Put `competitions = ["titanic"]` under `[kaggle]` to attach the data to every
+run of the project (accept the rules on kaggle.com first); it then lives under
+`{input}` (`/kaggle/input`) -- the runner prints the real layout each run. The
+same section takes `kernels = [...]` and `models = [...]`. These commands work
+in a bare directory, without a `kgr.toml`.
+
 ### Driving it from other tooling
 
 Every command returns a meaningful exit code (`wait`: 0 COMPLETE, 1 ERROR or
-cancelled, 2 status unreadable), so wrapping it is plain shell:
+cancelled, 2 status unreadable; `cancel`: 0 stopped or already finished, 1 could
+not cancel), so wrapping it is plain shell:
 
 ```bash
 kgr run "$RUN" --extra "$FLAGS" \
@@ -217,9 +311,20 @@ These each cost a real run before they were handled:
 | `run.require_gpu` | `true` | abort when no GPU is attached |
 | `run.min_cuda_capability` | `7.0` | abort below this (`""` disables) |
 | `run.setup` | `[]` | shell commands run before `command` |
+| `kaggle.competitions` | `[]` | competition data to attach (`titanic`) |
+| `kaggle.kernels` | `[]` | other kernels whose output the job reads |
+| `kaggle.models` | `[]` | model refs to attach |
+| `cancel.session_env` | `""` | kernel variable that holds the session id, when it is not auto-detected |
+| `cancel.wait` | `90` | seconds `kgr cancel` waits for the stop |
 | `fetch.dest` | `outputs` | local destination |
 | `fetch.glob` | `{run}*` | files to copy out of the downloaded output |
 | `hooks.pre_push` | `[]` | local commands that must succeed before pushing |
+
+## Windows
+
+`kgr` runs natively. The kaggle CLI's output is decoded as UTF-8 regardless of
+the console codepage (cp949 / cp1252 used to garble or crash log reading).
+Settings shared by all projects go in `~/.kgr.toml`.
 
 ## Development
 
@@ -230,8 +335,10 @@ python -m unittest discover -s tests -v
 The tests use `tests/fake_kaggle.py`, which implements the CLI calls `kgr`
 makes and really executes pushed kernels locally (with inputs laid out like
 `/kaggle/input`), so push → run → resume → fetch is covered end to end
-without an account. The runner uses `bash`, so run them on Linux, macOS or
-WSL.
+without an account, including `cancel` (the one API call is replaced by a stub)
+and the SIGTERM hand-over. The runner uses `bash` and symlinks, so run them on
+Linux, macOS or WSL; on plain Windows the tests that execute a kernel are
+skipped.
 
 ## License
 

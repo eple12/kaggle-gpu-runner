@@ -4,7 +4,8 @@
 [kaggle]
 user = "your-kaggle-username"
 project = "kgr-example"
-accelerator = "NvidiaTeslaT4"
+accelerator = "NvidiaTeslaT4"   # or t4 / p100 / l4 / none
+# competitions = ["titanic"]    # attach competition data under /kaggle/input
 
 [bundle]
 include = ["train.py"]

@@ -66,10 +66,14 @@ def main(a):
         out.mkdir(parents=True)
         env = {**os.environ, "KGR_INPUT_ROOT": str(inputs), "KGR_WORKING_ROOT": str(out),
                "KGR_BUNDLE_DIR": str(HOME / "bundles" / ks)}
+        # What a real Kaggle container exposes (names are the fake's own choice).
+        env.update(KAGGLE_KERNEL_RUN_TYPE="Batch", KAGGLE_SESSION_ID="424242",
+                   KAGGLE_DATA_PROXY_TOKEN="very-secret", KAGGLE_URL_BASE="https://www.kaggle.com",
+                   PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
         r = subprocess.run([sys.executable, str(src / meta["code_file"])], env=env,
-                           capture_output=True, text=True)
-        (k / "log.txt").write_text(r.stdout + r.stderr)
-        (out / f"{ks}.log").write_text(r.stdout + r.stderr)
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        (k / "log.txt").write_text(r.stdout + r.stderr, encoding="utf-8")
+        (out / f"{ks}.log").write_text(r.stdout + r.stderr, encoding="utf-8")
         (k / "status").write_text("COMPLETE" if r.returncode == 0 else "ERROR")
         (k / "meta.json").write_text(json.dumps(meta))
         (k / "push_args.json").write_text(json.dumps(a))
@@ -87,7 +91,23 @@ def main(a):
         return 0
 
     if a[:2] == ["kernels", "logs"]:
-        print((HOME / "kernels" / slug(a[2]) / "log.txt").read_text())
+        print((HOME / "kernels" / slug(a[2]) / "log.txt").read_text(encoding="utf-8"))
+        return 0
+
+    if a[:1] == ["quota"]:
+        print("GPU: 3.00h used of 30.00h")
+        return 0
+
+    if a[:2] == ["competitions", "download"]:
+        import zipfile
+        dest = Path(arg_after(a, "-p"))
+        dest.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(dest / f"{a[2]}.zip", "w") as zf:
+            zf.writestr("train.csv", "a,b\n1,2\n")
+        return 0
+
+    if a[:2] == ["competitions", "submit"]:
+        (HOME / "submit.json").write_text(json.dumps(a))
         return 0
 
     print(f"fake kaggle: unsupported {a}", file=sys.stderr)

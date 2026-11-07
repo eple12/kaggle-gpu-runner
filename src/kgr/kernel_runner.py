@@ -12,21 +12,40 @@ a script kernel. On Kaggle it:
      directory, so the job can resume,
   5. runs the configured command, streaming its output.
 
+Before anything else it prints one `KGR_SESSION_INFO {json}` line (and writes
+kgr_session.json): what this kernel knows about itself, which `kgr info` and
+`kgr cancel` use to find the session. On SIGTERM it forwards the signal to the
+job (best effort: a real `kgr cancel` was observed to kill the session
+without delivering it, so checkpoint to disk periodically).
+
 For a local dry run, point KGR_INPUT_ROOT / KGR_WORKING_ROOT / KGR_BUNDLE_DIR
 at scratch directories and pass the config as a JSON file argument.
 """
 import json
 import os
+import re
 import shutil
+import signal
+import socket
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 from pathlib import Path
 
 BUNDLE_TAR = "kgr_bundle.tar.gz"
 BUNDLE_MARKER = "kgr_bundle_root.json"
 SEARCH_DEPTH = 4
+
+# `kgr info` / `kgr cancel` read this line back out of the kernel log.
+SESSION_MARK = "KGR_SESSION_INFO"
+SESSION_FILE = "kgr_session.json"
+SECRET_WORDS = ("TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "COOKIE",
+                "AUTH", "KEY", "PRIVATE")
+ID_NAME_HINTS = ("SESSION", "KERNEL", "RUN", "CONTAINER", "JOB", "POD",
+                 "INSTANCE", "NOTEBOOK", "VERSION")
+GRACE_SECONDS = 25   # after SIGTERM the job gets this long to save and exit
 
 
 def log(*args, **kwargs):
@@ -41,6 +60,51 @@ def extract(tar_path, dest):
             tf.extractall(dest, filter="data")
         else:
             tf.extractall(dest)
+
+
+def read_text(path):
+    try:
+        return Path(path).read_text(errors="replace")
+    except OSError:
+        return ""
+
+
+def session_info(cfg):
+    """Everything this kernel can say about itself.
+
+    The Kaggle CLI has no call that returns the id of a running session, but
+    the API can cancel one by id -- so the kernel reports whatever identifies
+    it (KAGGLE_* environment, hostname, container id) and `kgr` reads it back
+    from the log. Secrets are redacted: the log is also what the owner sees.
+    """
+    env, candidates = {}, {}
+    for k, v in sorted(os.environ.items()):
+        up = k.upper()
+        if not up.startswith(("KAGGLE", "KGR_")):
+            continue
+        env[k] = "<redacted>" if any(w in up for w in SECRET_WORDS) else v[:300]
+        if v.strip().isdigit() and any(h in up for h in ID_NAME_HINTS):
+            candidates[k] = int(v)
+    containers = set()
+    for src in ("/proc/self/cgroup", "/proc/self/mountinfo", "/etc/hostname"):
+        containers.update(re.findall(r"\b[0-9a-f]{64}\b", read_text(src)))
+    return {
+        "run": cfg["run"], "project": cfg["project"], "build_id": cfg["build_id"],
+        "hostname": socket.gethostname(), "pid": os.getpid(),
+        "containers": sorted(containers), "id_candidates": candidates,
+        "env": env,
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z",
+    }
+
+
+def announce_session(cfg, working):
+    info = session_info(cfg)
+    try:
+        working.mkdir(parents=True, exist_ok=True)
+        (working / SESSION_FILE).write_text(json.dumps(info, indent=2))
+    except OSError:
+        pass
+    log(f"{SESSION_MARK} {json.dumps(info, separators=(',', ':'))}")
 
 
 def gpu_report():
@@ -108,6 +172,38 @@ def find_bundle(input_root, build_id):
     return None, seen
 
 
+def forward_termination(proc, flag):
+    """If this process is signalled, pass SIGTERM on to the job so it can save,
+    and kill it if it does not exit within GRACE_SECONDS. Best effort: on
+    Kaggle, `kgr cancel` ended the session without any signal reaching here
+    (verified on a live kernel); files already on disk did survive."""
+    if not hasattr(signal, "SIGTERM") or not hasattr(os, "killpg"):
+        return
+
+    def killpg(sig):
+        try:
+            os.killpg(proc.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    def handler(signum, frame):
+        if flag:
+            return
+        flag.append(signum)
+        log(f"\nreceived signal {signum}: forwarding to the job, "
+            f"{GRACE_SECONDS}s to save and exit")
+        killpg(signal.SIGTERM)
+        t = threading.Timer(GRACE_SECONDS, lambda: killpg(signal.SIGKILL))
+        t.daemon = True
+        t.start()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, handler)
+        except ValueError:      # not the main thread
+            pass
+
+
 def render(template, subs):
     for k, v in subs.items():
         template = template.replace("{" + k + "}", v)
@@ -123,6 +219,7 @@ def main(cfg):
 
     log("=" * 64)
     log(f"kgr  project={cfg['project']}  run={run}  build={cfg['build_id'][:8]}")
+    announce_session(cfg, working)   # first, so even a run that aborts below is cancellable
     device, cap = gpu_report()
     if device == "cpu" and cfg["require_gpu"]:
         sys.exit("No GPU attached although one was requested. Kaggle silently "
@@ -211,10 +308,15 @@ def main(cfg):
     log(f"launching: {cmd}")
     p = subprocess.Popen(["bash", "-c", cmd], cwd=workdir, env=env,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                         text=True, bufsize=1, errors="replace")
+                         text=True, bufsize=1, errors="replace",
+                         start_new_session=True)
+    terminated = []
+    forward_termination(p, terminated)
     for line in p.stdout:
         print(line.rstrip("\n"), flush=True)
     rc = p.wait()
+    if terminated:
+        log(f"\nkernel was asked to stop (signal {terminated[0]}); the job exited rc={rc}")
 
     outputs = sorted(x for x in out_dir.rglob("*") if x.is_file())
     log(f"\ncommand exited rc={rc} after {(time.time() - t0) / 60:.1f} min")
@@ -222,6 +324,7 @@ def main(cfg):
         log(f"  output: {f.relative_to(working)}  {f.stat().st_size / 1e6:.1f} MB")
     (working / "kgr_run_summary.json").write_text(json.dumps({
         "run": run, "build_id": cfg["build_id"], "rc": rc, "device": device,
+        "terminated": bool(terminated),
         "minutes": round((time.time() - t0) / 60, 2),
         "resumed": sorted(resumed), "outputs": [str(f.relative_to(working)) for f in outputs],
     }, indent=2))

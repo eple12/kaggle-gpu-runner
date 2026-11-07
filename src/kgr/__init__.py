@@ -1,2 +1,2 @@
-"""kaggle-gpu-runner: train on Kaggle GPU kernels from the command line."""
-__version__ = "0.1.0"
+"""kaggle-gpu-runner: run jobs on Kaggle GPU kernels from the command line."""
+__version__ = "0.2.0"
